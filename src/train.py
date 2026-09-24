@@ -40,7 +40,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=("baseline", "layer_id", "cosine", "brier_head", "brier_logit", "brier_full"),
+        choices=(
+            "baseline",
+            "layer_id",
+            "cosine",
+            "brier_head",
+            "brier_logit",
+            "brier_full",
+            "brier_layers",
+            "brier_shift",
+            "smooth",
+        ),
         default="baseline",
     )
     parser.add_argument("--lam", type=float, default=0.0, help="weight on the auxiliary term")
@@ -115,6 +125,8 @@ def evaluate(model: GPT, data: CharData, args: argparse.Namespace, device: torch
     top_probs = []
     head_probs = []
     outcomes = []
+    future_heads = []
+    future_outcomes = []
     for _ in range(args.eval_batches):
         x, y = data.batch("val", args.batch_size, device)
         logits, hiddens, features = model(x)
@@ -123,10 +135,13 @@ def evaluate(model: GPT, data: CharData, args: argparse.Namespace, device: torch
         totals["probe_acc"] += accuracy.item()
         totals["cosine"] += consecutive_cosine(hiddens).item()
         totals["depth_energy"] += depth_direction_energy(hiddens)
-        outcome = correctness(logits, y).flatten().cpu()
+        outcome_seq = correctness(logits, y).cpu()
+        head_seq = confidence_probability(features, model.confidence_head, stopgrad=True).cpu()
         top_probs.append(softmax_confidence(logits).flatten().cpu())
-        head_probs.append(confidence_probability(features, model.confidence_head, stopgrad=True).flatten().cpu())
-        outcomes.append(outcome)
+        head_probs.append(head_seq.flatten())
+        outcomes.append(outcome_seq.flatten())
+        future_heads.append(head_seq[:, :-16].flatten())
+        future_outcomes.append(outcome_seq[:, 16:].flatten())
     model.train()
     stats = {key: value / args.eval_batches for key, value in totals.items()}
     top = torch.cat(top_probs)
@@ -145,6 +160,8 @@ def evaluate(model: GPT, data: CharData, args: argparse.Namespace, device: torch
             "q_when_right": _masked_mean(head, right),
             "q_when_wrong": _masked_mean(head, ~right),
             "val_acc": float(outcome.mean()),
+            "future_corr": safe_corr(torch.cat(future_heads), torch.cat(future_outcomes)),
+            "future_ece": expected_calibration_error(torch.cat(future_heads), torch.cat(future_outcomes)),
         }
     )
     return stats
@@ -230,6 +247,32 @@ def main() -> None:
             loss = loss + args.lam * binary_brier(softmax_confidence(logits), outcome)
         elif args.mode == "brier_full":
             loss = loss + args.lam * multiclass_brier(logits, y)
+        elif args.mode == "brier_layers":
+            # Each layer's own next-token guess is scored with Brier. Early layers
+            # can satisfy this by staying uncertain; they are not asked to match
+            # the final prediction.
+            layer_terms = []
+            for hidden in hiddens:
+                layer_logits = model.lm_head(model.ln_f(hidden))
+                layer_outcome = correctness(layer_logits, y).detach()
+                layer_terms.append(binary_brier(softmax_confidence(layer_logits), layer_outcome))
+            loss = loss + args.lam * torch.stack(layer_terms).mean()
+        elif args.mode == "brier_shift":
+            # Features at t predict whether the guess at t+16 is correct, so the
+            # head cannot read the margin of the token it is scoring.
+            shift = 16
+            if features.size(1) <= shift:
+                raise SystemExit("brier_shift needs a block longer than 16")
+            shifted = confidence_probability(features[:, :-shift], model.confidence_head, stopgrad=False)
+            future = outcome[:, shift:]
+            loss = loss + args.lam * binary_brier(shifted, future)
+        elif args.mode == "smooth":
+            # lam is the label-smoothing mass, kept as a control for brier_full.
+            classes = logits.size(-1)
+            log_probs = torch.log_softmax(logits, dim=-1)
+            one_hot = torch.nn.functional.one_hot(y, classes).to(log_probs.dtype)
+            soft = (1.0 - args.lam) * one_hot + args.lam / classes
+            loss = -(soft * log_probs).sum(dim=-1).mean()
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
