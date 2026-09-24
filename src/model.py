@@ -110,6 +110,7 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.tok_emb.weight
         self.layer_id_head = LayerIdHead(d_model, n_layer)
+        self.confidence_head = nn.Linear(d_model, 1)
         self.apply(self._init_weights)
         residual_std = 0.02 / math.sqrt(2 * n_layer)
         for block in self.blocks:
@@ -135,12 +136,37 @@ class GPT(nn.Module):
         for block in self.blocks:
             x = block(x)
             hiddens.append(x)
-        logits = self.lm_head(self.ln_f(x))
-        return logits, hiddens
+        features = self.ln_f(x)
+        logits = self.lm_head(features)
+        return logits, hiddens, features
 
 
 def task_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+
+def correctness(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    return (logits.argmax(dim=-1) == targets).to(logits.dtype)
+
+
+def confidence_probability(features: torch.Tensor, head: nn.Linear, stopgrad: bool) -> torch.Tensor:
+    if stopgrad:
+        features = features.detach()
+    return torch.sigmoid(head(features).squeeze(-1))
+
+
+def binary_brier(probability: torch.Tensor, outcome: torch.Tensor) -> torch.Tensor:
+    return (probability - outcome).square().mean()
+
+
+def softmax_confidence(logits: torch.Tensor) -> torch.Tensor:
+    return torch.softmax(logits, dim=-1).amax(dim=-1)
+
+
+def multiclass_brier(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    probabilities = torch.softmax(logits, dim=-1)
+    one_hot = F.one_hot(targets, probabilities.size(-1)).to(probabilities.dtype)
+    return (probabilities - one_hot).square().sum(dim=-1).mean()
 
 
 def consecutive_cosine(hiddens: list[torch.Tensor]) -> torch.Tensor:

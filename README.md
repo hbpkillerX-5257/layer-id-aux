@@ -17,6 +17,9 @@ A cheap control trains the same classifier on detached hidden states, so the pro
 | `baseline` | next-character cross-entropy | trained on detached states |
 | `layer_id` | cross-entropy plus `λ` times layer-index cross-entropy | same readout, gradient enters the trunk |
 | `cosine` | cross-entropy plus `λ` times mean cosine of consecutive layers | trained on detached states |
+| `brier_head` | cross-entropy plus `λ` times Brier score of a scalar confidence head | head predicts whether the argmax token is correct |
+| `brier_logit` | cross-entropy plus `λ` times Brier score of the softmax top probability | the probability being scored is the model's own top guess |
+| `brier_full` | cross-entropy plus `λ` times the multiclass Brier score of the full softmax | no extra head |
 
 `depth_energy` is the fraction of between-layer mean variance that sits in the top singular direction. A value near 1 means the layers separated by a single depth stamp.
 

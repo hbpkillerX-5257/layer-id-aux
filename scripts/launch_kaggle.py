@@ -31,12 +31,12 @@ TIMEOUT_SECONDS = "5400"
 
 # One run per distinct account. Seeds are paired on the comparison that matters.
 RUNS = [
-    {"slug": "layer-id-aux-baseline-s1", "mode": "baseline", "lam": 0.0, "seed": 1},
-    {"slug": "layer-id-aux-baseline-s2", "mode": "baseline", "lam": 0.0, "seed": 2},
-    {"slug": "layer-id-aux-layerid-l005-s1", "mode": "layer_id", "lam": 0.05, "seed": 1},
-    {"slug": "layer-id-aux-layerid-l005-s2", "mode": "layer_id", "lam": 0.05, "seed": 2},
-    {"slug": "layer-id-aux-layerid-l02-s1", "mode": "layer_id", "lam": 0.2, "seed": 1},
-    {"slug": "layer-id-aux-cosine-l01-s1", "mode": "cosine", "lam": 0.1, "seed": 1},
+    {"slug": "conf-baseline-s1", "mode": "baseline", "lam": 0.0, "seed": 1},
+    {"slug": "conf-brier-head-l01-s1", "mode": "brier_head", "lam": 0.1, "seed": 1},
+    {"slug": "conf-brier-head-l01-s2", "mode": "brier_head", "lam": 0.1, "seed": 2},
+    {"slug": "conf-brier-logit-l01-s1", "mode": "brier_logit", "lam": 0.1, "seed": 1},
+    {"slug": "conf-brier-logit-l01-s2", "mode": "brier_logit", "lam": 0.1, "seed": 2},
+    {"slug": "conf-brier-full-l01-s1", "mode": "brier_full", "lam": 0.1, "seed": 1},
 ]
 
 

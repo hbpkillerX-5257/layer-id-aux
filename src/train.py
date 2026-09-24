@@ -1,13 +1,15 @@
-"""Train a tiny Shakespeare LM with an optional layer-index auxiliary loss.
+"""Train a tiny Shakespeare LM with an auxiliary loss.
 
 Modes
-  baseline  Task cross-entropy only. A linear layer-index probe is trained on
-            detached hidden states, so probe accuracy is logged and the trunk
-            is unchanged by it.
-  layer_id  Same probe, but its cross-entropy is added to the task loss and
-            updates the trunk. This is the depth-stamp auxiliary loss.
-  cosine    Penalize mean cosine similarity between consecutive layers. The
-            detached probe is still trained, as a measurement only.
+  baseline     Next-character cross-entropy. Probes are trained on detached
+               features and do not update the trunk.
+  layer_id     Add a layer-index classifier on the residual stream.
+  cosine       Penalize cosine similarity between consecutive layers.
+  brier_head   A scalar head predicts P(argmax is correct), scored with Brier,
+               and the gradient enters the trunk.
+  brier_logit  Brier score between the softmax's own top probability and
+               whether that top guess was correct. Gradient enters the logits.
+  brier_full   Multiclass Brier score of the whole softmax against the label.
 """
 
 from __future__ import annotations
@@ -21,12 +23,26 @@ from pathlib import Path
 import torch
 
 from src.data import CharData, load_text
-from src.model import GPT, consecutive_cosine, depth_direction_energy, task_loss
+from src.model import (
+    GPT,
+    binary_brier,
+    confidence_probability,
+    consecutive_cosine,
+    correctness,
+    depth_direction_energy,
+    multiclass_brier,
+    softmax_confidence,
+    task_loss,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("baseline", "layer_id", "cosine"), default="baseline")
+    parser.add_argument(
+        "--mode",
+        choices=("baseline", "layer_id", "cosine", "brier_head", "brier_logit", "brier_full"),
+        default="baseline",
+    )
     parser.add_argument("--lam", type=float, default=0.0, help="weight on the auxiliary term")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--steps", type=int, default=4000)
@@ -60,21 +76,78 @@ def set_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
         group["lr"] = lr
 
 
+def expected_calibration_error(confidence: torch.Tensor, correct: torch.Tensor, n_bins: int = 10) -> float:
+    edges = torch.linspace(0, 1, n_bins + 1)
+    total = confidence.numel()
+    error = confidence.new_zeros(())
+    for index in range(n_bins):
+        if index == 0:
+            mask = confidence <= edges[1]
+        else:
+            mask = (confidence > edges[index]) & (confidence <= edges[index + 1])
+        count = int(mask.sum())
+        if count == 0:
+            continue
+        gap = (correct[mask].mean() - confidence[mask].mean()).abs()
+        error = error + gap * (count / total)
+    return error.item()
+
+
+def safe_corr(left: torch.Tensor, right: torch.Tensor) -> float:
+    left = left - left.mean()
+    right = right - right.mean()
+    denom = left.std(unbiased=False) * right.std(unbiased=False)
+    if float(denom) < 1e-8:
+        return 0.0
+    return float((left * right).mean() / denom)
+
+
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> float:
+    if int(mask.sum()) == 0:
+        return 0.0
+    return float(values[mask].mean())
+
+
 @torch.no_grad()
 def evaluate(model: GPT, data: CharData, args: argparse.Namespace, device: torch.device) -> dict[str, float]:
     model.eval()
     totals = {"val_ce": 0.0, "probe_acc": 0.0, "cosine": 0.0, "depth_energy": 0.0}
+    top_probs = []
+    head_probs = []
+    outcomes = []
     for _ in range(args.eval_batches):
         x, y = data.batch("val", args.batch_size, device)
-        logits, hiddens = model(x)
-        aux, accuracy = model.layer_id_head(hiddens, stopgrad=True)
+        logits, hiddens, features = model(x)
+        _, accuracy = model.layer_id_head(hiddens, stopgrad=True)
         totals["val_ce"] += task_loss(logits, y).item()
         totals["probe_acc"] += accuracy.item()
         totals["cosine"] += consecutive_cosine(hiddens).item()
         totals["depth_energy"] += depth_direction_energy(hiddens)
-        del aux
+        outcome = correctness(logits, y).flatten().cpu()
+        top_probs.append(softmax_confidence(logits).flatten().cpu())
+        head_probs.append(confidence_probability(features, model.confidence_head, stopgrad=True).flatten().cpu())
+        outcomes.append(outcome)
     model.train()
-    return {key: value / args.eval_batches for key, value in totals.items()}
+    stats = {key: value / args.eval_batches for key, value in totals.items()}
+    top = torch.cat(top_probs)
+    head = torch.cat(head_probs)
+    outcome = torch.cat(outcomes)
+    right = outcome > 0.5
+    stats.update(
+        {
+            "ece_softmax": expected_calibration_error(top, outcome),
+            "ece_head": expected_calibration_error(head, outcome),
+            "q_std": float(head.std(unbiased=False)),
+            "pmax_std": float(top.std(unbiased=False)),
+            "corr_q_pmax": safe_corr(head, top),
+            "pmax_when_right": _masked_mean(top, right),
+            "pmax_when_wrong": _masked_mean(top, ~right),
+            "q_when_right": _masked_mean(head, right),
+            "q_when_wrong": _masked_mean(head, ~right),
+            "val_acc": float(outcome.mean()),
+        }
+    )
+    return stats
 
 
 def main() -> None:
@@ -131,26 +204,38 @@ def main() -> None:
         lr = learning_rate(step, args.steps, args.warmup, args.lr)
         set_lr(optimizer, lr)
         x, y = data.batch("train", args.batch_size, device)
-        logits, hiddens = model(x)
+        logits, hiddens, features = model(x)
         ce = task_loss(logits, y)
-        # Detached probe loss always trains the readout. The trunk only sees an
-        # auxiliary gradient in layer_id mode, scaled by lam.
+        # Detached probes always train the readouts. Trunk gradients below are
+        # the only path by which an auxiliary term can change the language model.
         aux, probe_acc = model.layer_id_head(hiddens, stopgrad=True)
+        outcome = correctness(logits, y).detach()
+        head_probability = confidence_probability(features, model.confidence_head, stopgrad=True)
+        head_brier = binary_brier(head_probability, outcome)
         if args.mode == "cosine":
             cosine = consecutive_cosine(hiddens)
         else:
             with torch.no_grad():
                 cosine = consecutive_cosine(hiddens)
-        loss = ce + aux
+        loss = ce
         if args.mode == "layer_id":
             aux_live, _ = model.layer_id_head(hiddens, stopgrad=False)
             loss = loss + args.lam * aux_live
         elif args.mode == "cosine":
             loss = loss + args.lam * cosine
+        elif args.mode == "brier_head":
+            live_probability = confidence_probability(features, model.confidence_head, stopgrad=False)
+            loss = loss + args.lam * binary_brier(live_probability, outcome)
+        elif args.mode == "brier_logit":
+            loss = loss + args.lam * binary_brier(softmax_confidence(logits), outcome)
+        elif args.mode == "brier_full":
+            loss = loss + args.lam * multiclass_brier(logits, y)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_([param for param in model.parameters() if param.grad is not None], 1.0)
+        head_brier.backward()
+        aux.backward()
         optimizer.step()
 
         if step % args.eval_interval == 0 or step == args.steps - 1:
@@ -161,6 +246,7 @@ def main() -> None:
                     "lr": lr,
                     "train_ce": ce.item(),
                     "train_aux": aux.item(),
+                    "train_brier": head_brier.item(),
                     "train_probe_acc": probe_acc.item(),
                     "train_cosine": cosine.item(),
                     "seconds": time.time() - t0,
@@ -172,8 +258,9 @@ def main() -> None:
                 handle.write(json.dumps(stats) + "\n")
             print(
                 f"step={step:5d} train_ce={stats['train_ce']:.3f} val_ce={stats['val_ce']:.3f} "
-                f"probe_acc={stats['probe_acc']:.3f} cosine={stats['cosine']:.3f} "
-                f"depth_energy={stats['depth_energy']:.3f} aux={stats['train_aux']:.3f}",
+                f"acc={stats['val_acc']:.3f} ece_p={stats['ece_softmax']:.3f} "
+                f"ece_q={stats['ece_head']:.3f} corr={stats['corr_q_pmax']:.3f} "
+                f"q_std={stats['q_std']:.3f}",
                 flush=True,
             )
 
