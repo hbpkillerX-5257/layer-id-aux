@@ -50,6 +50,8 @@ def parse_args() -> argparse.Namespace:
             "brier_layers",
             "brier_shift",
             "smooth",
+            "noise_brier",
+            "noise_ce",
         ),
         default="baseline",
     )
@@ -72,6 +74,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=Path("results"))
     parser.add_argument("--run-name", default="")
     return parser.parse_args()
+
+
+def _corrupt_tokens(tokens: torch.Tensor, vocab_size: int, rate: float) -> torch.Tensor:
+    mask = torch.rand(tokens.shape, device=tokens.device) < rate
+    replacement = torch.randint(0, vocab_size, tokens.shape, device=tokens.device)
+    return torch.where(mask, replacement, tokens)
 
 
 def learning_rate(step: int, total: int, warmup: int, base: float) -> float:
@@ -273,6 +281,20 @@ def main() -> None:
             one_hot = torch.nn.functional.one_hot(y, classes).to(log_probs.dtype)
             soft = (1.0 - args.lam) * one_hot + args.lam / classes
             loss = -(soft * log_probs).sum(dim=-1).mean()
+        elif args.mode == "noise_brier":
+            # Corrupt the input, then score that pass's confidence against whether
+            # it still predicted the clean next character. Memorizing the clean
+            # string does not make this target always-correct.
+            noisy = _corrupt_tokens(x, data.vocab_size, rate=0.15)
+            noisy_logits, _, _ = model(noisy)
+            noisy_outcome = correctness(noisy_logits, y).detach()
+            loss = loss + args.lam * binary_brier(softmax_confidence(noisy_logits), noisy_outcome)
+        elif args.mode == "noise_ce":
+            # Same corruption, but the task loss itself is computed on it.
+            # This is the control for noise_brier.
+            noisy = _corrupt_tokens(x, data.vocab_size, rate=0.15)
+            noisy_logits, _, _ = model(noisy)
+            loss = task_loss(noisy_logits, y)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()

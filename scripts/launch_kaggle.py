@@ -31,12 +31,10 @@ TIMEOUT_SECONDS = "5400"
 
 # One run per distinct account. Seeds are paired on the comparison that matters.
 RUNS = [
-    {"slug": "conf-shift-l05-s1", "mode": "brier_shift", "lam": 0.5, "seed": 1},
-    {"slug": "conf-shift-l05-s2", "mode": "brier_shift", "lam": 0.5, "seed": 2},
-    {"slug": "conf-logit-l1-s1", "mode": "brier_logit", "lam": 1.0, "seed": 1},
-    {"slug": "conf-logit-l1-s2", "mode": "brier_logit", "lam": 1.0, "seed": 2},
-    {"slug": "conf-layers-l05-s1", "mode": "brier_layers", "lam": 0.5, "seed": 1},
-    {"slug": "conf-smooth-e01-s1", "mode": "smooth", "lam": 0.1, "seed": 1},
+    {"slug": "conf-noise-brier-l1-s1", "mode": "noise_brier", "lam": 1.0, "seed": 1},
+    {"slug": "conf-noise-brier-l1-s2", "mode": "noise_brier", "lam": 1.0, "seed": 2},
+    {"slug": "conf-noise-ce-s1", "mode": "noise_ce", "lam": 1.0, "seed": 1},
+    {"slug": "conf-noise-ce-s2", "mode": "noise_ce", "lam": 1.0, "seed": 2},
 ]
 
 
